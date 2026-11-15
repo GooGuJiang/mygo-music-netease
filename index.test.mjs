@@ -814,3 +814,34 @@ test("podcast repeated offsets recover only with a complete bounded prefix", asy
     assert.ok(calls.every(limit=>limit<=2000));
   }
 });
+
+// The session can change after request() validates it but before its caller resumes.
+test("stream completion rejects a sign-out queued while persisting its response", async () => {
+  const {plugin,storage}=await setup(async()=>response({code:200,data:[{id:1,code:200,url:'https://m1.music.126.net/song.mp3',type:'mp3'}]}),{cookies:{MUSIC_U:'synthetic'},profile:null});
+  const persist=host.storage.set;
+  host.storage.set=(key,value)=>{persist(key,value);if(key==='session')queueMicrotask(()=>plugin.signOut());};
+  const pending=[plugin.stream({id:'1'}),plugin.stream({id:'1'})];
+  for(const outcome of await Promise.allSettled(pending)){
+    assert.equal(outcome.status,'rejected');
+    assert.match(outcome.reason.message,/账号状态已改变/);
+  }
+  assert.equal(storage.has('session'),false);
+});
+
+test("concurrent stream failures are shared and a later request starts fresh", async()=>{
+  let calls=0,release;
+  const gate=new Promise(resolve=>{release=resolve;});
+  const {plugin}=await setup(async()=>{
+    calls++;
+    if(calls===1){await gate;throw Error('synthetic transport failure');}
+    return response({code:200,data:[{id:1,code:200,url:'https://m1.music.126.net/song.mp3',type:'mp3'}]});
+  });
+  const pending=[plugin.stream({id:'1'}),plugin.stream({id:'1'})];
+  release();
+  const outcomes=await Promise.allSettled(pending);
+  assert.equal(calls,1);
+  assert.ok(outcomes.every(x=>x.status==='rejected'));
+  assert.equal(outcomes[0].reason,outcomes[1].reason);
+  assert.ok((await plugin.stream({id:'1'})).url);
+  assert.equal(calls,2);
+});

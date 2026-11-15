@@ -900,10 +900,14 @@ export async function stream({ id, quality = "high" }) {
   if (!id) throw fail("unavailable", "该播客节目没有可播放的音频");
   const generation = epoch;
   const key = `${generation}:${id}:${quality}`;
-  if (pendingStreams.has(key)) return pendingStreams.get(key);
-  const pending = loadStream(id, quality, generation);
+  const pending = pendingStreams.get(key) || loadStream(id, quality, generation);
   pendingStreams.set(key, pending);
-  try { return await pending; }
+  try {
+    const result = await pending;
+    // Every waiter must recheck after resuming, including shared requests.
+    if (generation !== epoch) throw new Error("账号状态已改变，请重试");
+    return result;
+  }
   finally { if (pendingStreams.get(key) === pending) pendingStreams.delete(key); }
 }
 
