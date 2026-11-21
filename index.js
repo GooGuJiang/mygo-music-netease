@@ -182,19 +182,25 @@ async function request(path, params = {}, options = {}) {
     if (cookie) headers.Cookie = cookie;
   }
   const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 12000);
+  const timer = setTimeout(() => controller.abort(), options.timeout ?? 12000);
   init.signal = controller.signal;
   let response, body;
   try {
     response = await fetch(url, init);
-    if (!response.ok) throw new Error(`网易云请求失败（HTTP ${response.status}）`);
+    if (!response.ok) {
+      const error = new Error(`网易云请求失败（HTTP ${response.status}）`);
+      error.retryable = [408, 500, 502, 503, 504].includes(response.status);
+      throw error;
+    }
     body = await response.json();
   } catch (error) {
-    if (controller.signal.aborted) throw new Error("网易云请求超时，请稍后重试");
+    if (controller.signal.aborted) {
+      throw Object.assign(new Error("网易云请求超时，请稍后重试"), { retryable: true });
+    }
     // Never put response bodies, request headers or login cookies in errors.
     if (response && !response.ok) throw error;
-    if (response) throw new Error("网易云返回的响应无法解析，请稍后重试");
-    throw new Error("无法读取网易云音乐，请检查网络及系统代理后重试");
+    if (response && error?.name !== "TypeError") throw new Error("网易云返回的响应无法解析，请稍后重试");
+    throw Object.assign(new Error("无法读取网易云音乐，请检查网络及系统代理后重试"), { retryable: true });
   } finally {
     clearTimeout(timer);
   }
@@ -930,19 +936,19 @@ async function loadStream(id, quality, generation) {
     try {
       data = await eapi("/api/song/enhance/player/url/v1", {
         ids: JSON.stringify([Number(id)]), level, encodeType: level === "lossless" ? "flac" : "mp3",
-      });
+      }, { timeout: 8000 });
       break;
     } catch (error) {
-      if (![460, -460].includes(error.neteaseCode)) throw error;
+      const refusedByService = [460, -460].includes(error.neteaseCode);
+      if (!refusedByService && !error.retryable) throw error;
       if (attempt === 1) {
+        if (!refusedByService) throw error;
         const refused = new Error(`[${error.neteaseCode}] 网易云仍拒绝播放请求，请稍后再试，并在官方客户端确认该歌曲可正常播放`);
         refused.neteaseCode = error.neteaseCode;
         throw refused;
       }
-      // One delayed retry of this read only, with the same device/account and
-      // quality. Never retry account mutations or turn permission failures
-      // into a different source, a preview, or a lower-quality success.
-      await new Promise(resolve => setTimeout(resolve, 1000));
+      // The retry uses the same device, account and quality as the original lookup.
+      await new Promise(resolve => setTimeout(resolve, refusedByService ? 1000 : 250));
     }
   }
   const audio = (data.data || []).find((item) => String(item.id) === id);

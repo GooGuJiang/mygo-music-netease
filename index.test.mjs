@@ -357,6 +357,56 @@ test("stream does not retry expired authentication or trial audio", async () => 
   }
 });
 
+// A temporary transport failure retries the same track and quality once for all waiters.
+test("stream recovers from temporary network failures", async (t) => {
+  const timer = globalThis.setTimeout;
+  let timeoutFirstRequest = false;
+  t.mock.method(globalThis, "setTimeout", (fn, ms, ...args) => {
+    if (ms === 8000 && timeoutFirstRequest) {
+      timeoutFirstRequest = false;
+      queueMicrotask(() => fn(...args));
+      return 0;
+    }
+    return timer(fn, ms === 250 ? 0 : ms, ...args);
+  });
+  for (const fail of [
+    () => { throw new TypeError("connection reset"); },
+    () => ({ ...response(null), json: async () => { throw new TypeError("body interrupted"); } }),
+    () => ({ ok: false, status: 503 }),
+    (signal) => new Promise((_, reject) =>
+      signal.addEventListener("abort", () => reject(signal.reason), { once: true })),
+  ]) {
+    timeoutFirstRequest = fail.length > 0;
+    const requests = [];
+    const { plugin } = await setup(async (_url, init) => {
+      requests.push(decode(init.body).data);
+      if (requests.length === 1) return fail(init.signal);
+      return response({ code: 200, data: [{ id: 1, url: "https://m1.music.126.net/song.flac", type: "flac" }] });
+    }, { cookies: { MUSIC_U: "synthetic-session" }, profile: null });
+    const lookup = () => plugin.stream({ id: "1", quality: "lossless" });
+    const [a, b] = await Promise.all([lookup(), lookup()]);
+    assert.deepEqual(a, b);
+    assert.equal(a.type, "flac");
+    assert.equal(requests.length, 2);
+    assert.ok(requests.every(req => req.ids === "[1]" && req.level === "lossless" &&
+      req.header.MUSIC_U === "synthetic-session" && req.header.deviceId === requests[0].header.deviceId));
+  }
+});
+
+// A response that requires user action or is malformed does not get a second request.
+test("stream does not retry HTTP denial, throttling or malformed JSON", async () => {
+  for (const denial of [
+    { ok: false, status: 403 },
+    { ok: false, status: 429 },
+    { ...response(null), json: async () => { throw new SyntaxError("invalid JSON"); } },
+  ]) {
+    let calls = 0;
+    const { plugin } = await setup(async () => { calls++; return denial; });
+    await assert.rejects(plugin.stream({ id: "1" }));
+    assert.equal(calls, 1);
+  }
+});
+
 // Personal recommendations require a real session before making their requests.
 test("guests can discover entries but private recommendations ask for sign-in", async () => {
   let calls = 0;
@@ -833,17 +883,17 @@ test("concurrent stream failures are shared and a later request starts fresh", a
   const gate=new Promise(resolve=>{release=resolve;});
   const {plugin}=await setup(async()=>{
     calls++;
-    if(calls===1){await gate;throw Error('synthetic transport failure');}
+    if(calls<=2){await gate;throw Error('synthetic transport failure');}
     return response({code:200,data:[{id:1,code:200,url:'https://m1.music.126.net/song.mp3',type:'mp3'}]});
   });
   const pending=[plugin.stream({id:'1'}),plugin.stream({id:'1'})];
   release();
   const outcomes=await Promise.allSettled(pending);
-  assert.equal(calls,1);
+  assert.equal(calls,2);
   assert.ok(outcomes.every(x=>x.status==='rejected'));
   assert.equal(outcomes[0].reason,outcomes[1].reason);
   assert.ok((await plugin.stream({id:'1'})).url);
-  assert.equal(calls,2);
+  assert.equal(calls,3);
 });
 
 test("eapi requests pair the desktop User-Agent with the PC payload and host", async () => {
